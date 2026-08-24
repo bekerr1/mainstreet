@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -181,5 +183,122 @@ func TestWorktreesAreNotFetchedWhileHidden(t *testing.T) {
 	shown.syncSelection(false)
 	if shown.wtDir != "/repo" {
 		t.Errorf("shown pane should fetch for the selection, wtDir = %q", shown.wtDir)
+	}
+}
+
+func TestScanSubdirsSkipsNoiseHiddenAndSymlinks(t *testing.T) {
+	root := t.TempDir()
+	mkdirs(t, root,
+		"envoy/envoy-main",
+		"envoy/envoy-slack-invite",
+		"live-expo/live-expo-main",
+		"live-expo/node_modules/some-pkg",
+		".hidden-dir",
+		"llmc/llm.c/.git",
+		"deep/a/b/c/d", // 4 levels: deeper than maxScanDepth should reach
+	)
+	if err := os.Symlink(root, filepath.Join(root, "a-symlink")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	got := scanSubdirs(root)
+	want := map[string]bool{
+		"envoy": true, "envoy/envoy-main": true, "envoy/envoy-slack-invite": true,
+		"live-expo": true, "live-expo/live-expo-main": true,
+		"llmc": true, "llmc/llm.c": true,
+		"deep": true, "deep/a": true, "deep/a/b": true,
+	}
+	for _, g := range got {
+		if !want[g] {
+			t.Errorf("scanSubdirs returned %q, which should have been filtered", g)
+		}
+		delete(want, g)
+	}
+	if len(want) != 0 {
+		t.Errorf("scanSubdirs missed: %v", want)
+	}
+}
+
+func mkdirs(t *testing.T, root string, rels ...string) {
+	t.Helper()
+	for _, rel := range rels {
+		if err := os.MkdirAll(filepath.Join(root, rel), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", rel, err)
+		}
+	}
+}
+
+func TestFilterDirsRanksBoundaryMatchesFirst(t *testing.T) {
+	options := []string{
+		"envoy/envoy-main",
+		"envoy/envoy-slack-invite",
+		"live-expo/live-expo-main",
+		"llmc/llm.c",
+		"my-agent",
+	}
+
+	if got := filterDirs(options, ""); len(got) != len(options) {
+		t.Errorf("empty query should return everything (under the cap), got %v", got)
+	}
+
+	// "em" should favour envoy-main over envoy-slack-invite: 'm' lands right
+	// after a path separator in one and mid-word in the other.
+	got := filterDirs(options, "em")
+	if len(got) == 0 || got[0] != "envoy/envoy-main" {
+		t.Errorf("filterDirs(\"em\") top match = %v, want envoy/envoy-main first", got)
+	}
+
+	if got := filterDirs(options, "zzz-nope"); len(got) != 0 {
+		t.Errorf("no subsequence match should return nothing, got %v", got)
+	}
+}
+
+func TestModalStateResolvedDir(t *testing.T) {
+	base := "/home/b/Development"
+
+	// Nothing typed: the session lands in cwd itself, not in whatever
+	// happens to be first in the scan.
+	empty := modalState{baseDir: base, dirCursor: -1}
+	if got := empty.resolvedDir(); got != base {
+		t.Errorf("empty state resolvedDir = %q, want baseDir %q", got, base)
+	}
+
+	// A highlighted fuzzy match wins.
+	picked := modalState{
+		baseDir: base, dirQuery: "env",
+		dirMatches: []string{"envoy/envoy-main", "envoy/envoy-slack-invite"},
+		dirCursor:  0,
+	}
+	if got := picked.resolvedDir(); got != filepath.Join(base, "envoy/envoy-main") {
+		t.Errorf("resolvedDir = %q, want the highlighted match joined to baseDir", got)
+	}
+
+	// Typed text past the scan depth, with nothing highlighted, is taken
+	// literally rather than rejected.
+	literal := modalState{baseDir: base, dirQuery: "some/very/deep/path", dirCursor: -1}
+	if got := literal.resolvedDir(); got != filepath.Join(base, "some/very/deep/path") {
+		t.Errorf("resolvedDir = %q, want the literal query joined to baseDir", got)
+	}
+}
+
+func TestRefilterDirsResetsCursor(t *testing.T) {
+	s := modalState{dirOptions: []string{"envoy/envoy-main", "live-expo/live-expo-main"}}
+
+	s.dirQuery = "envoy"
+	s.refilterDirs()
+	if s.dirCursor != 0 {
+		t.Errorf("a query with hits should highlight the top match, dirCursor = %d", s.dirCursor)
+	}
+
+	s.dirQuery = ""
+	s.refilterDirs()
+	if s.dirCursor != -1 {
+		t.Errorf("clearing the query should deselect, dirCursor = %d", s.dirCursor)
+	}
+
+	s.dirQuery = "zzz-nope"
+	s.refilterDirs()
+	if s.dirCursor != -1 {
+		t.Errorf("a query with no hits should deselect, dirCursor = %d", s.dirCursor)
 	}
 }
