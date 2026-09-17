@@ -56,10 +56,17 @@ var (
 // should gate it on whether a client is actually attached.
 const refreshInterval = 2 * time.Second
 
-// agentPollInterval is the redraw rate while an agent window has focus. Each
-// poll is one capture-pane, and the next is only scheduled when the previous
+// agentPollInterval is the idle redraw rate while an agent window has focus.
+// Each poll is one capture, and the next is only scheduled when the previous
 // returns, so a slow capture throttles itself instead of piling up.
 const agentPollInterval = 120 * time.Millisecond
+
+// echoDelay is how long we wait after forwarding a keystroke before capturing
+// again. Typing does not wait for the idle poll: the agent draws the character
+// itself, so without a capture of its own every letter appeared up to a full
+// poll interval late, which is most of what made the live view feel laggy. The
+// few milliseconds give the program in the pane time to actually draw.
+const echoDelay = 12 * time.Millisecond
 
 // ---------------------------------------------------------------------------
 // Model
@@ -106,6 +113,22 @@ type model struct {
 	// and polls it fast enough to feel live. You never leave mainstreet.
 	agentFocus bool
 
+	// keys forwards keystrokes to the focused agent. It owns a goroutine, so
+	// the event loop never waits on a fork, and it is the only writer, so the
+	// order you typed in is the order tmux sees.
+	keys *keySender
+
+	// capturing is the target of the capture in flight, empty when there is
+	// none, and pollQueued says whether the next poll tick is already booked.
+	// Together they hold the live view to exactly one loop.
+	//
+	// Without them it forked: the 2s refresh asks for a capture too, and every
+	// capture scheduled a fresh tick, so a second loop appeared every 2s and
+	// none ever died. A minute in the agent view meant thirty concurrent
+	// capture-panes per interval, and typing crawled.
+	capturing  string
+	pollQueued bool
+
 	// showWorktrees keeps the pool pane out of the way until asked for. While
 	// hidden its treehouse call is skipped entirely, so moving the cursor
 	// costs nothing.
@@ -143,12 +166,13 @@ type previewMsg struct {
 	err    error
 }
 
-type cursorPos struct {
-	x, y    int
-	visible bool
-}
-
 type agentPollMsg struct{}
+
+// echoMsg asks for a capture shortly after a keystroke was forwarded.
+type echoMsg struct{}
+
+// keyErrMsg is a send-keys failure, surfaced from the sender's goroutine.
+type keyErrMsg struct{ err error }
 
 type tickMsg time.Time
 
@@ -157,11 +181,16 @@ func newModel() model {
 	t := tmuxClient{r: r}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	return model{tmux: t, th: treehouseClient{r: r}, self: t.CurrentSession(ctx)}
+	return model{
+		tmux: t,
+		th:   treehouseClient{r: r},
+		self: t.CurrentSession(ctx),
+		keys: newKeySender(t),
+	}
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(refreshCmd(m.tmux), tickCmd())
+	return tea.Batch(refreshCmd(m.tmux), tickCmd(), keyErrCmd(m.keys))
 }
 
 func refreshCmd(t tmuxClient) tea.Cmd {
@@ -183,25 +212,54 @@ func worktreeCmd(th treehouseClient, dir string) tea.Cmd {
 }
 
 // previewCmd captures a pane, and its cursor too when the pane is live. The
-// cursor costs a second subprocess, so the idle preview - which nobody types
-// into - does not pay for it.
+// idle preview - which nobody types into - asks for the cheaper capture that
+// leaves the cursor out.
 func previewCmd(t tmuxClient, tgt string, wantCursor bool) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		lines, err := t.CapturePaneANSI(ctx, tgt)
-		msg := previewMsg{target: tgt, lines: lines, err: err}
-		if err == nil && wantCursor {
-			if x, y, visible, cerr := t.CursorPos(ctx, tgt); cerr == nil {
-				msg.cursor = cursorPos{x: x, y: y, visible: visible}
-			}
+		if !wantCursor {
+			lines, err := t.CapturePaneANSI(ctx, tgt)
+			return previewMsg{target: tgt, lines: lines, err: err}
 		}
-		return msg
+		lines, cur, err := t.CaptureAgent(ctx, tgt)
+		return previewMsg{target: tgt, lines: lines, cursor: cur, err: err}
 	}
 }
 
 func agentPollCmd() tea.Cmd {
 	return tea.Tick(agentPollInterval, func(time.Time) tea.Msg { return agentPollMsg{} })
+}
+
+func echoCmd() tea.Cmd {
+	return tea.Tick(echoDelay, func(time.Time) tea.Msg { return echoMsg{} })
+}
+
+// keyErrCmd parks on the sender's error channel. It re-arms itself, so one
+// failed send-keys does not take the reporting with it.
+func keyErrCmd(s *keySender) tea.Cmd {
+	return func() tea.Msg { return keyErrMsg{err: <-s.errs} }
+}
+
+// capture asks for a new frame unless one is already on its way. Dropping the
+// duplicate is the point: a keystroke, the poll tick and the refresh can all
+// want a frame at the same moment, and concurrent capture-panes only race to
+// draw the same pane.
+func (m *model) capture() tea.Cmd {
+	if m.previewTarget == "" || m.capturing == m.previewTarget {
+		return nil
+	}
+	m.capturing = m.previewTarget
+	return previewCmd(m.tmux, m.previewTarget, m.agentFocus)
+}
+
+// queuePoll books the next idle frame of the live view, at most one deep.
+func (m *model) queuePoll() tea.Cmd {
+	if m.pollQueued || !m.agentFocus {
+		return nil
+	}
+	m.pollQueued = true
+	return agentPollCmd()
 }
 
 func tickCmd() tea.Cmd {
@@ -231,20 +289,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case previewMsg:
-		if msg.target != m.previewTarget {
-			return m, nil // a response for a session we have moved away from
+		if msg.target == m.capturing {
+			m.capturing = ""
 		}
-		m.preview, m.previewErr, m.agentCursor = msg.lines, msg.err, msg.cursor
-		if m.agentFocus {
-			return m, agentPollCmd()
+		if msg.target == m.previewTarget {
+			m.preview, m.previewErr, m.agentCursor = msg.lines, msg.err, msg.cursor
 		}
-		return m, nil
+		// Queue the next frame even for a response we have moved away from,
+		// or switching sessions while live would strand the loop.
+		return m, m.queuePoll()
 
 	case agentPollMsg:
-		if !m.agentFocus || m.previewTarget == "" {
+		m.pollQueued = false
+		if !m.agentFocus {
 			return m, nil
 		}
-		return m, previewCmd(m.tmux, m.previewTarget, m.agentFocus)
+		return m, m.capture()
+
+	case echoMsg:
+		return m, m.capture()
+
+	case keyErrMsg:
+		m.notice = msg.err.Error()
+		return m, keyErrCmd(m.keys)
 
 	case actionMsg:
 		if msg.err != nil {
@@ -445,8 +512,11 @@ func (m *model) syncSelection(force bool) tea.Cmd {
 			m.previewTarget, m.preview, m.previewErr = tgt, nil, nil
 		}
 		m.previewWin = w
-		if changed || force {
-			cmds = append(cmds, previewCmd(m.tmux, tgt, m.agentFocus))
+		// While the agent is live its own loop owns the frame rate. Forcing a
+		// capture on every refresh tick as well is what used to fork a second
+		// loop each time the tick ran.
+		if changed || (force && !m.agentFocus) {
+			cmds = append(cmds, m.capture())
 		}
 	} else {
 		m.previewTarget, m.preview, m.previewWin = "", nil, Window{}
@@ -483,7 +553,7 @@ func (m model) focusAgent() (tea.Model, tea.Cmd) {
 	m.agentFocus = true
 	m.previewWin = w
 	m.previewTarget = target(s.Name, w.Index)
-	return m, tea.Batch(previewCmd(m.tmux, m.previewTarget, m.agentFocus), agentPollCmd())
+	return m, tea.Batch(m.capture(), m.queuePoll())
 }
 
 // handleAgentKey forwards everything to the agent, so the escape hatch has to
@@ -498,16 +568,11 @@ func (m model) handleAgentKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if !ok {
 		return m, nil
 	}
-	// Sent synchronously rather than as a tea.Cmd. Bubble Tea runs commands in
-	// concurrent goroutines, so a burst of keystrokes races: typing
-	// "echo hello" arrived as "echohello" because the space overtook the word
-	// before it. A send-keys is a few milliseconds; ordering is worth it.
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if err := m.tmux.SendKeys(ctx, m.previewTarget, literal, key); err != nil {
-		m.notice = err.Error()
-	}
-	return m, nil
+	// Handing the key to the sender is a channel write, so the next keystroke
+	// is read while this one is still being spawned. Ordering comes from the
+	// sender being the only writer; failures come back as keyErrMsg.
+	m.keys.send(keystroke{target: m.previewTarget, key: key, literal: literal})
+	return m, echoCmd()
 }
 
 // attachAgent lands you in the agent window rather than wherever the session

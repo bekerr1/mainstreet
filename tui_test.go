@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func TestFitTruncatesAndPads(t *testing.T) {
@@ -300,5 +302,113 @@ func TestRefilterDirsResetsCursor(t *testing.T) {
 	s.refilterDirs()
 	if s.dirCursor != -1 {
 		t.Errorf("a query with no hits should deselect, dirCursor = %d", s.dirCursor)
+	}
+}
+
+// liveModel is a dashboard sitting in the live agent view, with a capture
+// already in flight - the steady state the poll loop runs in.
+func liveModel() model {
+	return model{
+		state: State{Sessions: []Session{{
+			Name: "evals",
+			Dir:  "/w",
+			Windows: []Window{
+				{Index: 0, Name: "agent", Active: true, Command: "claude", Path: "/w"},
+			},
+		}}},
+		agentFocus:    true,
+		previewTarget: "evals:0",
+		capturing:     "evals:0",
+	}
+}
+
+// The live view must stay exactly one poll loop however many things ask for a
+// frame. It used to fork: the 2s refresh forced a capture of its own, every
+// capture booked a fresh tick, and nothing ever retired the old one - so the
+// capture rate climbed for as long as you sat there, and typing crawled.
+func TestAgentPollStaysOneLoop(t *testing.T) {
+	m := liveModel()
+
+	// A frame arrives. It books the next tick, and exactly one.
+	next, cmd := m.Update(previewMsg{target: "evals:0"})
+	m = next.(model)
+	if m.capturing != "" {
+		t.Fatalf("frame did not clear the in-flight capture, got %q", m.capturing)
+	}
+	if !m.pollQueued || cmd == nil {
+		t.Fatal("frame did not book the next poll")
+	}
+
+	// The refresh tick lands mid-loop. It may not start a capture of its own,
+	// and it may not book a second tick.
+	next, cmd = m.Update(stateMsg{st: m.state})
+	m = next.(model)
+	if m.capturing != "" {
+		t.Errorf("refresh forked a second capture of %q", m.capturing)
+	}
+	if cmd != nil {
+		t.Error("refresh scheduled work while the agent was live")
+	}
+	if !m.pollQueued {
+		t.Error("refresh retired the queued poll")
+	}
+
+	// Nor may a second frame, whatever produced it.
+	if _, cmd = m.Update(previewMsg{target: "evals:0"}); cmd != nil {
+		t.Error("a second frame booked a second poll")
+	}
+
+	// The tick fires: one capture goes out, and the tick is spent.
+	next, cmd = m.Update(agentPollMsg{})
+	m = next.(model)
+	if m.pollQueued {
+		t.Error("a fired tick still counts as queued")
+	}
+	if m.capturing != "evals:0" || cmd == nil {
+		t.Fatalf("tick did not capture, capturing=%q", m.capturing)
+	}
+
+	// Typing wants a frame too, but not a duplicate of the one in flight.
+	if _, cmd = m.Update(echoMsg{}); cmd != nil {
+		t.Error("echo captured on top of a capture already in flight")
+	}
+}
+
+// Leaving the live view has to end the loop, or it polls a pane nobody is
+// looking at for the rest of the session.
+func TestAgentPollStopsWhenFocusLeaves(t *testing.T) {
+	m := liveModel()
+	m.agentFocus = false
+
+	if _, cmd := m.Update(previewMsg{target: "evals:0"}); cmd != nil {
+		t.Error("the loop outlived the focus")
+	}
+}
+
+// A frame for a pane we have moved on from is stale, but the loop still has to
+// come out the other side of it.
+func TestStalePreviewKeepsTheLoopAlive(t *testing.T) {
+	m := liveModel()
+	m.previewTarget = "other:0"
+
+	next, cmd := m.Update(previewMsg{target: "evals:0", lines: []string{"stale"}})
+	m = next.(model)
+	if m.preview != nil {
+		t.Errorf("stale frame was drawn: %q", m.preview)
+	}
+	if !m.pollQueued || cmd == nil {
+		t.Error("stale frame stranded the loop")
+	}
+}
+
+// Typing echoes off the pane, so a keystroke has to pull a frame of its own
+// rather than wait out the idle poll.
+func TestTypingAsksForAFrame(t *testing.T) {
+	m := liveModel()
+	m.keys = newKeySender(tmuxClient{r: &recordingRunner{}})
+	m.capturing = ""
+
+	if _, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")}); cmd == nil {
+		t.Error("a keystroke scheduled no redraw")
 	}
 }

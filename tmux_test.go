@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -107,25 +109,39 @@ func TestSessionsRejectsMalformedLine(t *testing.T) {
 // the commands mainstreet builds. This is how the mutating operations get
 // covered: creating and killing sessions for real in a test would touch the
 // developer's actual tmux server.
+//
+// It is mutex-guarded because the keystroke sender calls tmux from its own
+// goroutine, which is the whole reason it exists.
 type recordingRunner struct {
+	mu      sync.Mutex
 	calls   [][]string
 	windows string
 	capture string
 }
 
 func (r *recordingRunner) run(_ context.Context, _ string, argv ...string) ([]byte, error) {
-	r.calls = append(r.calls, argv)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, append([]string(nil), argv...))
 	switch argv[1] {
 	case "list-windows":
 		return []byte(r.windows), nil
-	case "capture-pane":
+	// A combined cursor-then-capture reads as display-message; both answer
+	// from the same fixture.
+	case "capture-pane", "display-message":
 		return []byte(r.capture), nil
 	}
 	return nil, nil
 }
 
+func (r *recordingRunner) argv() [][]string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([][]string(nil), r.calls...)
+}
+
 func (r *recordingRunner) find(sub string) []string {
-	for _, c := range r.calls {
+	for _, c := range r.argv() {
 		if len(c) > 1 && c[1] == sub {
 			return c
 		}
@@ -286,5 +302,195 @@ func TestTmuxKeyMapping(t *testing.T) {
 func TestStripANSI(t *testing.T) {
 	if got := stripANSI("\x1b[32mgreen\x1b[0m"); got != "green" {
 		t.Errorf("stripANSI = %q, want %q", got, "green")
+	}
+}
+
+// sentKeys reconstructs the key stream from recorded send-keys calls, so a
+// burst split across calls reads the same as one that was not.
+func sentKeys(calls [][]string) []string {
+	var out []string
+	for _, argv := range calls {
+		if len(argv) < 5 || argv[1] != "send-keys" {
+			continue
+		}
+		if argv[4] == "-l" {
+			for _, r := range argv[5] {
+				out = append(out, string(r))
+			}
+			continue
+		}
+		out = append(out, argv[4:]...)
+	}
+	return out
+}
+
+func TestCoalesceGroupsWhatOneSendKeysCanCarry(t *testing.T) {
+	runs := coalesce([]keystroke{
+		{target: "s:0", key: "h", literal: true},
+		{target: "s:0", key: "i", literal: true},
+		{target: "s:0", key: "Enter"},
+		{target: "s:0", key: "Up"},
+		{target: "s:0", key: "x", literal: true},
+		{target: "other:0", key: "y", literal: true},
+	})
+
+	want := []keyRun{
+		{target: "s:0", literal: true, keys: []string{"h", "i"}},
+		{target: "s:0", keys: []string{"Enter", "Up"}},
+		{target: "s:0", literal: true, keys: []string{"x"}},
+		{target: "other:0", literal: true, keys: []string{"y"}},
+	}
+	if len(runs) != len(want) {
+		t.Fatalf("got %d runs, want %d: %+v", len(runs), len(want), runs)
+	}
+	for i := range want {
+		if runs[i].target != want[i].target || runs[i].literal != want[i].literal ||
+			strings.Join(runs[i].keys, ",") != strings.Join(want[i].keys, ",") {
+			t.Errorf("run %d = %+v, want %+v", i, runs[i], want[i])
+		}
+	}
+}
+
+// -l takes the whole run as one argument; named keys go one per argument.
+func TestSendKeysArgv(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  keyRun
+		want string
+	}{
+		{"literal run joins", keyRun{target: "s:0", literal: true, keys: []string{"h", "i"}},
+			"tmux send-keys -t s:0 -l hi"},
+		{"named keys stay apart", keyRun{target: "s:0", keys: []string{"Enter", "Up"}},
+			"tmux send-keys -t s:0 Enter Up"},
+	} {
+		rec := &recordingRunner{}
+		if err := (tmuxClient{r: rec}).SendKeys(context.Background(), tc.run); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got := strings.Join(rec.argv()[0], " "); got != tc.want {
+			t.Errorf("%s: %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The sender exists to keep bursts in order without stalling the event loop.
+// Typing "echo hello" once arrived as "echohello", because the space overtook
+// the word in front of it.
+func TestKeySenderPreservesOrder(t *testing.T) {
+	rec := &recordingRunner{}
+	s := newKeySender(tmuxClient{r: rec})
+
+	var want []string
+	for _, r := range "echo hello" {
+		s.send(keystroke{target: "s:0", key: string(r), literal: true})
+		want = append(want, string(r))
+	}
+	s.send(keystroke{target: "s:0", key: "Enter"})
+	want = append(want, "Enter")
+
+	var got []string
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		if got = sentKeys(rec.argv()); len(got) == len(want) {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if strings.Join(got, "") != strings.Join(want, "") {
+		t.Errorf("tmux saw %q, want %q", got, want)
+	}
+}
+
+// The cursor is read in the same call as the capture, on the line in front of
+// it - a pane can print anything, including a line that looks like a cursor.
+func TestCaptureAgentReadsCursorThenScreen(t *testing.T) {
+	rec := &recordingRunner{capture: "7,2,1\n$ ls\n56,24,1\n\n\n"}
+
+	lines, cur, err := (tmuxClient{r: rec}).CaptureAgent(context.Background(), "s:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur != (cursorPos{x: 7, y: 2, visible: true}) {
+		t.Errorf("cursor = %+v, want {7 2 true}", cur)
+	}
+	if strings.Join(lines, "|") != "$ ls|56,24,1" {
+		t.Errorf("lines = %q", lines)
+	}
+
+	// One tmux invocation, not two.
+	if n := len(rec.argv()); n != 1 {
+		t.Errorf("made %d tmux calls, want 1", n)
+	}
+}
+
+// A cursor tmux will not give us fails the frame rather than drawing the
+// screen with a stale block on it.
+func TestCaptureAgentRejectsAnUnreadableCursor(t *testing.T) {
+	for _, capture := range []string{"", "not-a-cursor\n$ ls\n", "7,2\n$ ls\n"} {
+		rec := &recordingRunner{capture: capture}
+		if _, _, err := (tmuxClient{r: rec}).CaptureAgent(context.Background(), "s:0"); err == nil {
+			t.Errorf("capture %q was accepted", capture)
+		}
+	}
+}
+
+// failingRunner refuses one target and accepts every other.
+type failingRunner struct {
+	recordingRunner
+	bad string
+}
+
+func (f *failingRunner) run(ctx context.Context, dir string, argv ...string) ([]byte, error) {
+	out, err := f.recordingRunner.run(ctx, dir, argv...)
+	for _, a := range argv {
+		if a == f.bad {
+			return nil, fmt.Errorf("can't find pane: %s", f.bad)
+		}
+	}
+	return out, err
+}
+
+// A burst spans two panes when keys are still draining as the live view moves
+// on. One dead pane must not swallow the keys bound for the live one.
+func TestKeySenderDoesNotDropOtherTargetsOnFailure(t *testing.T) {
+	rec := &failingRunner{bad: "dead:0"}
+	s := newKeySender(tmuxClient{r: rec})
+
+	s.send(keystroke{target: "dead:0", key: "a", literal: true})
+	s.send(keystroke{target: "live:0", key: "b", literal: true})
+
+	var got []string
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		if got = sentKeys(rec.argv()); len(got) == 2 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if strings.Join(got, "") != "ab" {
+		t.Errorf("tmux saw %q, want both keys attempted", got)
+	}
+
+	select {
+	case err := <-s.errs:
+		if !strings.Contains(err.Error(), "dead:0") {
+			t.Errorf("reported %v, want the dead pane", err)
+		}
+	case <-time.After(time.Second):
+		t.Error("the failure was never reported")
+	}
+}
+
+// A keystroke that cannot be queued has to say so. Silently eating input is
+// the failure mode the whole live view exists to avoid.
+func TestKeySenderReportsDroppedKeys(t *testing.T) {
+	s := &keySender{keys: make(chan keystroke), errs: make(chan error, 1)} // no pump, so nothing drains
+	s.send(keystroke{target: "s:0", key: "x", literal: true})
+
+	select {
+	case err := <-s.errs:
+		if !strings.Contains(err.Error(), "dropped") {
+			t.Errorf("reported %v, want a drop", err)
+		}
+	default:
+		t.Error("a dropped keystroke was swallowed")
 	}
 }

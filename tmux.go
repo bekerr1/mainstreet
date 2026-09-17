@@ -344,22 +344,23 @@ func (t tmuxClient) CapturePaneANSI(ctx context.Context, tgt string) ([]string, 
 	if err != nil {
 		return nil, err
 	}
-	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
-	for len(lines) > 0 && strings.TrimSpace(stripANSI(lines[len(lines)-1])) == "" {
-		lines = lines[:len(lines)-1]
-	}
-	return lines, nil
+	return trimBlankTail(strings.Split(strings.TrimRight(string(out), "\n"), "\n")), nil
 }
 
-// SendKeys forwards a keystroke to a window. tmux routes it to that window's
-// active pane, and the window does not have to be the session's current one -
-// which is what lets mainstreet drive an agent without attaching to anything.
-func (t tmuxClient) SendKeys(ctx context.Context, tgt string, literal bool, key string) error {
-	argv := []string{"tmux", "send-keys", "-t", tgt}
-	if literal {
-		argv = append(argv, "-l")
+// SendKeys forwards a run of keystrokes to a window. tmux routes them to that
+// window's active pane, and the window does not have to be the session's
+// current one - which is what lets mainstreet drive an agent without attaching
+// to anything.
+func (t tmuxClient) SendKeys(ctx context.Context, r keyRun) error {
+	argv := []string{"tmux", "send-keys", "-t", r.target}
+	if r.literal {
+		// -l sends the argument as-is: no key-name lookup and no escape
+		// processing, so a run can be joined into one argument and a typed
+		// backslash stays a backslash.
+		argv = append(argv, "-l", strings.Join(r.keys, ""))
+	} else {
+		argv = append(argv, r.keys...)
 	}
-	argv = append(argv, key)
 	_, err := t.r.run(ctx, "", argv...)
 	return err
 }
@@ -412,24 +413,181 @@ func tmuxKey(msg tea.KeyMsg) (key string, literal bool, ok bool) {
 	return "", false, false
 }
 
-// CursorPos reports where the cursor sits in a window's active pane, and
-// whether it is visible at all - a full-screen program can hide it. The
-// coordinates are pane-relative and zero-based.
-func (t tmuxClient) CursorPos(ctx context.Context, tgt string) (x, y int, visible bool, err error) {
-	out, err := t.r.run(ctx, "", "tmux", "display-message", "-p", "-t", tgt,
-		"#{cursor_x},#{cursor_y},#{cursor_flag}")
+const cursorFormat = "#{cursor_x},#{cursor_y},#{cursor_flag}"
+
+// CaptureAgent reads a pane's screen and its cursor position in one tmux call.
+// The live agent view runs this several times a second, and one fork per frame
+// instead of two is the difference between typing that echoes and typing that
+// trails.
+//
+// The cursor is asked for first so it is always the one line before the
+// capture. The other way round the boundary would have to be guessed, and a
+// pane can print anything - including a line that looks like a cursor report.
+//
+// A cursor that will not parse fails the whole frame. Reading it separately
+// used to swallow that error and draw the screen anyway, which left the block
+// sitting wherever it was last seen; a live view has to be trusted about where
+// your next character is going.
+func (t tmuxClient) CaptureAgent(ctx context.Context, tgt string) ([]string, cursorPos, error) {
+	out, err := t.r.run(ctx, "",
+		"tmux", "display-message", "-p", "-t", tgt, cursorFormat,
+		";", "capture-pane", "-e", "-p", "-t", tgt)
 	if err != nil {
-		return 0, 0, false, err
+		return nil, cursorPos{}, err
 	}
-	f := strings.Split(strings.TrimSpace(string(out)), ",")
+	// Split always yields at least one element, so the cursor line is there
+	// even for empty output - parseCursor is what rejects it.
+	all := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+	cur, err := parseCursor(all[0])
+	if err != nil {
+		return nil, cursorPos{}, err
+	}
+	return trimBlankTail(all[1:]), cur, nil
+}
+
+// cursorPos is where the cursor sits in a pane and whether it is visible at
+// all - a full-screen program can hide it. Coordinates are pane-relative and
+// zero-based.
+type cursorPos struct {
+	x, y    int
+	visible bool
+}
+
+func parseCursor(line string) (cursorPos, error) {
+	f := strings.Split(strings.TrimSpace(line), ",")
 	if len(f) != 3 {
-		return 0, 0, false, fmt.Errorf("tmux: unexpected cursor format %q", out)
+		return cursorPos{}, fmt.Errorf("tmux: unexpected cursor format %q", line)
 	}
-	if x, err = strconv.Atoi(f[0]); err != nil {
-		return 0, 0, false, err
+	x, err := strconv.Atoi(f[0])
+	if err != nil {
+		return cursorPos{}, err
 	}
-	if y, err = strconv.Atoi(f[1]); err != nil {
-		return 0, 0, false, err
+	y, err := strconv.Atoi(f[1])
+	if err != nil {
+		return cursorPos{}, err
 	}
-	return x, y, f[2] == "1", nil
+	return cursorPos{x: x, y: y, visible: f[2] == "1"}, nil
+}
+
+func trimBlankTail(lines []string) []string {
+	for len(lines) > 0 && strings.TrimSpace(stripANSI(lines[len(lines)-1])) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
+}
+
+// ---------------------------------------------------------------------------
+// Keystroke forwarding
+// ---------------------------------------------------------------------------
+
+// keystroke is one key on its way to a pane, already translated into what
+// send-keys wants.
+type keystroke struct {
+	target  string
+	key     string
+	literal bool
+}
+
+// keyRun is consecutive keystrokes that a single send-keys can carry: same
+// target, and either all literal or all named, because -l is a flag for the
+// whole command rather than a per-key one.
+type keyRun struct {
+	target  string
+	literal bool
+	keys    []string
+}
+
+// keySender forwards keystrokes to tmux from one goroutine.
+//
+// send-keys used to run inline in Update. Bubble Tea runs commands in
+// concurrent goroutines, so issuing it as a command raced - typing
+// "echo hello" arrived as "echohello" when the space overtook the word before
+// it - and running it inline instead cost the event loop a fork per character.
+// A single consumer draining a FIFO gives the ordering without the stall, and
+// coalescing whatever queued up during the previous call means a burst costs
+// one tmux invocation rather than one per byte.
+type keySender struct {
+	tmux tmuxClient
+	keys chan keystroke
+	errs chan error
+}
+
+func newKeySender(t tmuxClient) *keySender {
+	s := &keySender{
+		tmux: t,
+		keys: make(chan keystroke, 512),
+		errs: make(chan error, 1),
+	}
+	go s.pump()
+	return s
+}
+
+// send queues a keystroke and returns immediately. It drops the key rather
+// than block: a full queue means tmux has been wedged for seconds, and waiting
+// there would freeze the whole dashboard instead of just the one pane. The
+// drop is reported, never silent - a keystroke that vanishes without a trace
+// is the one failure a thing you type into must not have.
+func (s *keySender) send(k keystroke) {
+	select {
+	case s.keys <- k:
+	default:
+		s.fail(fmt.Errorf("tmux: input backed up, dropped %q", k.key))
+	}
+}
+
+// fail reports the first failure to reach it and discards any piled up behind
+// it. The dashboard has one notice line, so a queue of them would do nothing
+// but overwrite each other.
+func (s *keySender) fail(err error) {
+	select {
+	case s.errs <- err:
+	default:
+	}
+}
+
+func (s *keySender) pump() {
+	for k := range s.keys {
+		// A pane that has gone away fails every run aimed at it, so the rest
+		// of the burst headed there is abandoned. Runs for other targets are
+		// not: coalesce splits by target, and a burst spans two panes when
+		// keys are still draining as the live view moves to another session.
+		var dead string
+		for _, run := range coalesce(append([]keystroke{k}, s.drain()...)) {
+			if run.target == dead {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			err := s.tmux.SendKeys(ctx, run)
+			cancel()
+			if err != nil {
+				dead = run.target
+				s.fail(err)
+			}
+		}
+	}
+}
+
+// drain takes everything queued right now without waiting for more.
+func (s *keySender) drain() []keystroke {
+	var out []keystroke
+	for {
+		select {
+		case k := <-s.keys:
+			out = append(out, k)
+		default:
+			return out
+		}
+	}
+}
+
+func coalesce(ks []keystroke) []keyRun {
+	var runs []keyRun
+	for _, k := range ks {
+		if n := len(runs); n > 0 && runs[n-1].target == k.target && runs[n-1].literal == k.literal {
+			runs[n-1].keys = append(runs[n-1].keys, k.key)
+			continue
+		}
+		runs = append(runs, keyRun{target: k.target, literal: k.literal, keys: []string{k.key}})
+	}
+	return runs
 }

@@ -284,16 +284,26 @@ size, that is what attaching to the session is for. Because tmux drives a window
 current one, the target session is not disturbed at all: its active window is
 exactly where you left it.
 
-Two constraints shaped this:
+Three constraints shaped this:
 
 - **No `join-pane`.** tmux can physically move an agent's pane into another
   window, which would give a real terminal with no polling. It needs mainstreet
   to be running inside tmux, and mainstreet deliberately is not - see Attach
   above. Capture-and-forward is the approach that survives that decision.
-- **Keys are sent synchronously.** Bubble Tea runs commands in concurrent
-  goroutines, so a burst of keystrokes issued as commands races and arrives out
-  of order - typing "echo hello" produced "echohello". A `send-keys` is a few
-  milliseconds and ordering is worth blocking for.
+- **Keys go through one sender goroutine.** Bubble Tea runs commands in
+  concurrent goroutines, so a burst of keystrokes issued as commands races and
+  arrives out of order - typing "echo hello" produced "echohello". Sending
+  inline from `Update` instead fixed the order, but charged the event loop a
+  fork per character. A single consumer draining a FIFO keeps the ordering
+  without the stall, and coalesces whatever queued during the previous call
+  into as few `send-keys` as the keys allow. A key that cannot be queued at all
+  is dropped *and reported* - input that vanishes silently is the one failure a
+  thing you type into must not have.
+- **The live view is exactly one poll loop.** One capture in flight, one tick
+  booked, no more. This is written down because it regressed once: the refresh
+  tick forced a capture of its own and every capture booked a fresh tick, so a
+  second loop appeared every couple of seconds and none ever died. The fork
+  rate climbed past 700/s and typing crawled.
 
 The cursor is drawn from `#{cursor_x}`/`#{cursor_y}`/`#{cursor_flag}` as one
 cell of reverse video, counted in *visible* columns so colour escapes in the
