@@ -93,8 +93,13 @@ type actionMsg struct{ err error }
 
 type attachDoneMsg struct{ err error }
 
+// newSessionCmd creates dir first if it does not exist, so typing a new path
+// in the dir field is a way to start a project, not an error.
 func newSessionCmd(t tmuxClient, name, dir string) tea.Cmd {
 	return func() tea.Msg {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return actionMsg{err: err}
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		return actionMsg{err: t.NewSession(ctx, name, dir, defaultLayout)}

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -492,5 +494,20 @@ func TestKeySenderReportsDroppedKeys(t *testing.T) {
 		}
 	default:
 		t.Error("a dropped keystroke was swallowed")
+	}
+}
+
+func TestNewSessionCmdCreatesMissingDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "not", "there", "yet")
+	rec := &recordingRunner{windows: row("0", "agent", "1", "bash", dir)}
+	msg := newSessionCmd(tmuxClient{r: rec}, "proj", dir)()
+	if err := msg.(actionMsg).err; err != nil {
+		t.Fatalf("newSessionCmd: %v", err)
+	}
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		t.Errorf("want %s created as a directory, stat err: %v", dir, err)
+	}
+	if got := rec.find("new-session"); !contains(got, "-c", dir) {
+		t.Errorf("new-session argv wrong: %v", got)
 	}
 }
